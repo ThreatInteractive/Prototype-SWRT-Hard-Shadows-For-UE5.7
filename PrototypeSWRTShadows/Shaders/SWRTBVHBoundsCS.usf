@@ -1,0 +1,125 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Refits node bounds bottom up, one dispatch per tree level.
+//
+// The tree's SHAPE comes from the CPU build and is reused across frames; only
+// the bounds are recomputed here, which is what lets a skinned source keep its
+// tree while its vertices move. The leaf level reads triangles, every level
+// above it reads the children written by the previous dispatch.
+//
+// Bounds are quantised to 16 bits per axis inside the node's frame, so a node
+// is one uint4: three components of bounds and the descriptor.
+//
+// Permutations:
+//   SWRT_BVH_LEAF_LEVEL        read triangles rather than child nodes
+//   SWRT_BVH_PER_SOURCE_FRAME  quantise in the source's own frame, not the scene's
+//   SWRT_BVH_INSTANCE_LEVEL    the top level, where an unreached instance is
+//                              collapsed to an empty box instead of refitted
+
+#include "/Engine/Private/Common.ush"
+
+Buffer<float4> SWRTBvhTriangles;
+Buffer<uint> SWRTBvhDescs;
+Buffer<uint> SWRTBvhLevelNodes;
+Buffer<uint> SWRTBvhInstanceVisible;
+RWBuffer<uint4> SWRTBvhNodes;
+
+float3 SWRTBvhSceneMin;
+float3 SWRTBvhQuantScale;
+
+#if SWRT_BVH_PER_SOURCE_FRAME
+Buffer<float4> SWRTBvhFrames;
+Buffer<uint> SWRTBvhNodeSources;
+#endif
+
+uint SWRTBvhNodeOffset;
+uint SWRTBvhNodeCount;
+
+#define SWRT_BVH_COUNT_SHIFT 25
+#define SWRT_BVH_COUNT_MASK  0x3Fu
+#define SWRT_BVH_LEAF_BIT    0x80000000u
+#define SWRT_BVH_FIRST_MASK  0x01FFFFFFu
+#define SWRT_BVH_QUANT_MAX   65535.0f
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (DispatchThreadId.x >= SWRTBvhNodeCount)
+	{
+		return;
+	}
+
+	const uint NodeIndex = SWRTBvhLevelNodes[SWRTBvhNodeOffset + DispatchThreadId.x];
+	const uint Desc = SWRTBvhDescs[NodeIndex];
+	const uint First = Desc & SWRT_BVH_FIRST_MASK;
+	const uint Count = (Desc >> SWRT_BVH_COUNT_SHIFT) & SWRT_BVH_COUNT_MASK;
+
+	uint3 QuantMin = (uint3)0xFFFFu;
+	uint3 QuantMax = (uint3)0u;
+
+#if SWRT_BVH_INSTANCE_LEVEL
+	// An instance no ray reached last frame keeps a box nothing can hit, so it
+	// costs one rejected bounds test instead of a refit and a descent.
+	if (SWRTBvhInstanceVisible[DispatchThreadId.x] == 0)
+	{
+		SWRTBvhNodes[NodeIndex] = uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, Desc);
+		return;
+	}
+#endif
+
+#if SWRT_BVH_LEAF_LEVEL
+	float3 BoundsMin = (float3)3.0e38f;
+	float3 BoundsMax = (float3)(-3.0e38f);
+
+	for (uint Triangle = 0; Triangle < Count; ++Triangle)
+	{
+		const uint Base = (First + Triangle) * 3;
+		const float3 V0 = SWRTBvhTriangles[Base + 0].xyz;
+		const float3 V1 = V0 + SWRTBvhTriangles[Base + 1].xyz;
+		const float3 V2 = V0 + SWRTBvhTriangles[Base + 2].xyz;
+		BoundsMin = min(BoundsMin, min(V0, min(V1, V2)));
+		BoundsMax = max(BoundsMax, max(V0, max(V1, V2)));
+	}
+
+#if SWRT_BVH_PER_SOURCE_FRAME
+	const uint SourceIndex = SWRTBvhNodeSources[NodeIndex];
+	const float3 FrameMin = SWRTBvhFrames[SourceIndex * 2 + 0].xyz;
+	const float3 FrameScale = SWRTBvhFrames[SourceIndex * 2 + 1].xyz;
+#else
+	const float3 FrameMin = SWRTBvhSceneMin;
+	const float3 FrameScale = SWRTBvhQuantScale;
+#endif
+
+	// Floor the minimum and ceil the maximum, so quantisation can only ever
+	// grow a box. A box that shrank would drop a hit.
+	const float3 ScaledMin = (BoundsMin - FrameMin) * FrameScale;
+	const float3 ScaledMax = (BoundsMax - FrameMin) * FrameScale;
+	QuantMin = (uint3)clamp(floor(ScaledMin), 0.0f, SWRT_BVH_QUANT_MAX);
+	QuantMax = (uint3)clamp(ceil(ScaledMax), 0.0f, SWRT_BVH_QUANT_MAX);
+#else
+	// Already quantised in the same frame, so the union is integer work.
+	for (uint Child = 0; Child < Count; ++Child)
+	{
+		const uint ChildIndex = First + Child;
+		const uint4 ChildNode = SWRTBvhNodes[ChildIndex];
+
+		const uint3 ChildMin = uint3(
+			ChildNode.x & 0xFFFFu,
+			ChildNode.x >> 16,
+			ChildNode.y & 0xFFFFu);
+		const uint3 ChildMax = uint3(
+			ChildNode.y >> 16,
+			ChildNode.z & 0xFFFFu,
+			ChildNode.z >> 16);
+
+		QuantMin = min(QuantMin, ChildMin);
+		QuantMax = max(QuantMax, ChildMax);
+	}
+#endif
+
+	SWRTBvhNodes[NodeIndex] = uint4(
+		QuantMin.x | (QuantMin.y << 16),
+		QuantMin.z | (QuantMax.x << 16),
+		QuantMax.y | (QuantMax.z << 16),
+		Desc);
+}

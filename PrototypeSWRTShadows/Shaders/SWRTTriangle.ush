@@ -1,0 +1,56 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Any hit ray triangle test, Moller and Trumbore.
+//
+// Nothing here needs the barycentrics themselves, only whether the ray crossed
+// the triangle inside the range, so this returns a bool and no hit record.
+
+#pragma once
+
+/**
+ * True when the ray crosses the triangle within [TMin, TMax]. Edge1 and Edge2
+ * are V1 minus V0 and V2 minus V0, which is how the triangles are stored.
+ */
+bool RayHitsTriangleEdges(
+	float3 Origin, float3 Direction, float TMin, float TMax,
+	float3 V0, float3 Edge1, float3 Edge2)
+{
+	const float3 PVec = cross(Direction, Edge2);
+	const float Determinant = dot(Edge1, PVec);
+
+	// Degenerate, or the ray runs along the triangle's plane.
+	if (abs(Determinant) < 1e-8f)
+	{
+		return false;
+	}
+
+	const float InvDeterminant = 1.0f / Determinant;
+	const float3 TVec = Origin - V0;
+
+	const float U = dot(TVec, PVec) * InvDeterminant;
+	if (U < 0.0f || U > 1.0f)
+	{
+		return false;
+	}
+
+	const float3 QVec = cross(TVec, Edge1);
+
+	const float V = dot(Direction, QVec) * InvDeterminant;
+	if (V < 0.0f || U + V > 1.0f)
+	{
+		return false;
+	}
+
+	const float T = dot(Edge2, QVec) * InvDeterminant;
+	if (T < TMin || T > TMax)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+bool RayHitsTriangle(float3 Origin, float3 Direction, float TMin, float TMax, float3 V0, float3 V1, float3 V2)
+{
+	return RayHitsTriangleEdges(Origin, Direction, TMin, TMax, V0, V1 - V0, V2 - V0);
+}

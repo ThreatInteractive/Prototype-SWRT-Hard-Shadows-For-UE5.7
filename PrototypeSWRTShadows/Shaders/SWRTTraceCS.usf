@@ -1,0 +1,936 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// One hard shadow ray per lit pixel, traversed in plain compute against a two
+// level BVH. Writes an R8 mask: 0 shadowed, 1 lit.
+//
+// THE RAY
+// From the surface reconstructed out of the depth buffer, toward the bulb. Any
+// hit ends it, so there is no closest hit search and no hit record.
+//
+// THE TWO LEVELS
+// The top level is a BVH over the PLACEMENTS. Each placement names a source and
+// carries a world to local transform, so two placements of the same mesh share
+// one copy of the triangles and one tree. Entering a placement transforms the
+// RAY rather than the geometry: three dot products against the rows at
+// SWRTInstanceTransforms[Index * 5 + 0..2].
+//
+// THE TILE LIST
+// SWRTTileInstanceCS has usually already worked out which placements an 8x8
+// tile's rays can reach, and the list replaces the top level walk for that
+// tile. The header word is the count, or the high bit set to mean the list is
+// unusable and the walk has to happen. A list is a shortcut, never a cull.
+//
+// QUANTISED BOUNDS
+// Node bounds are 16 bits an axis inside the node's own frame, so a node is one
+// uint4. The ray is transformed into that frame once per instance and the box
+// tests are then integer valued floats, which is why the traversal carries
+// QuantOrigin and QuantInvDirection alongside the real ray.
+//
+// Permutation:
+//   SWRT_STATS  compiles the per thread counters, the groupshared reductions
+//               and the debug views. Everything else is fixed by the host.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Plugins/PrototypeSWRTShadows/SWRTThreadGroupTiling.ush"
+
+/**
+ * A vertex and both edges, three float4 a triangle: three vector loads per
+ * triangle rather than nine scalar ones, with the edges already subtracted.
+ * That layout comes from The Forge, Apache License 2.0; see NOTICE.txt.
+ */
+Buffer<float4> SWRTTriangles;
+
+Buffer<float4> SWRTCasters;
+Buffer<uint> SWRTRoots;
+
+/** Two float4 a placement: world bounds, with the BLAS root node index in w. */
+Buffer<float4> SWRTInstances;
+
+/** Five float4 a placement: world to local rows 0 to 2, frame min, frame scale. */
+Buffer<float4> SWRTInstanceTransforms;
+
+Buffer<uint4> SWRTInstanceNodes;
+uint SWRTInstanceRoot;
+uint SWRTCasterCount;
+
+Buffer<uint4> SWRTNodes;
+float3 SWRTSceneMin;
+float3 SWRTQuantScale;
+float3 SWRTTriangleSpaceOffset;
+
+#define SWRT_COUNT_SHIFT 25
+#define SWRT_COUNT_MASK  0x3Fu
+#define SWRT_LEAF_BIT    0x80000000u
+#define SWRT_FIRST_MASK  0x01FFFFFFu
+
+Texture2D<float>   SWRTSceneDepth;
+RWTexture2D<float> SWRTOutMask;
+
+float3 SWRTLightPosition;
+float  SWRTLightRadius;
+float3 SWRTLightDirection;
+float  SWRTCosOuterCone;
+
+uint2  SWRTPixelMin;
+uint2  SWRTPixelMax;
+
+float SWRTHeatmapScale;
+uint SWRTDebugView;
+
+// The same numbering as r.SWRTSpotLight.Debug, so a view is one number from the
+// console to the mask to the colour. 1 is the shadow term, which needs no
+// measurement, so it never reaches here.
+#define SWRT_VIEW_OFF          0u
+#define SWRT_VIEW_LANE_WASTE   2u
+#define SWRT_VIEW_NODES        3u
+#define SWRT_VIEW_WARP_MIXED   4u
+
+Buffer<uint> SWRTTileInstances;
+uint SWRTTileInstanceStride;
+
+uint2  SWRTDispatchGrid;
+uint2  SWRTTileGrid;
+
+uint   SWRTSwizzleTileWidth;
+uint   SWRTSwizzlePerfectTileCTAs;
+uint   SWRTSwizzleTotalPerfectCTAs;
+uint   SWRTSwizzleLastTileWidth;
+uint3  SWRTSwizzleMagic;
+uint3  SWRTSwizzleMagicShift;
+
+float  SWRTRayStartBias;
+float  SWRTRayStartSlope;
+
+RWBuffer<uint> SWRTStats;
+
+/** One slot a placement, set when any ray reached it. */
+RWBuffer<uint> SWRTCasterHitsOut;
+
+#if SWRT_STATS
+static uint GStatRays = 0;
+static uint GStatNodes = 0;
+static uint GStatBounds = 0;
+static uint GStatTriangles = 0;
+static uint GStatInstanceNodes = 0;
+static uint GStatInstanceBounds = 0;
+static uint GStatLeafBounds = 0;
+static uint GStatLeafAccept = 0;
+static uint GStatInstancesReached = 0;
+static uint GStatInstancesEntered = 0;
+static uint GStatInstancesPassedBox = 0;
+static uint GStatMaxStack = 0;
+static uint GStatMaxInstanceStack = 0;
+static uint GStatStackOverflow = 0;
+static uint GStatStage = 0;
+static uint GStatHit = 0;
+
+/** Which placements the whole group touched, for the shared work measurement. */
+#define SWRT_TILE_MASK_WORDS 32
+groupshared uint GGroupInstanceMask[SWRT_TILE_MASK_WORDS];
+#endif
+
+// Where a thread stopped, in test order. The default is 0, so a thread that
+// returns before anything else counts as out of rect.
+#define SWRT_STAGE_OUT_OF_RECT   0u
+#define SWRT_STAGE_NO_DEPTH      1u
+#define SWRT_STAGE_OUT_OF_RANGE  2u
+#define SWRT_STAGE_OUT_OF_CONE   3u
+#define SWRT_STAGE_DEGENERATE    4u
+#define SWRT_STAGE_TRACED        5u
+#define SWRT_STAGE_COUNT         6u
+
+#if SWRT_STATS
+	#define SWRT_SET_STAGE(Stage) GStatStage = (Stage);
+#else
+	#define SWRT_SET_STAGE(Stage)
+#endif
+
+// 8x16: four warps, and a warp's 32 consecutive lanes still cover the same 8x4
+// pixels, so the group is two vertically adjacent TILES rather than one wider
+// one.
+#define SWRT_GROUP_X 8
+#define SWRT_GROUP_Y 16
+#define SWRT_GROUP_THREADS (SWRT_GROUP_X * SWRT_GROUP_Y)
+
+#define SWRT_TILE_X 8
+#define SWRT_TILE_Y 8
+
+// These two arrays are the shader's only large locals, and the driver backs
+// them with shared memory, which is what holds resident blocks down. Sized
+// from what rays actually reach, with margin, since an overflow drops a node
+// and thins a shadow: the stats line reports the high water mark and an
+// OVERFLOWS count. Deepest measured is 12 and 6.
+#define SWRT_STACK_SIZE 16
+#define SWRT_INSTANCE_STACK_SIZE 8
+#define SWRT_MAX_ARITY 4
+
+bool RayHitsBounds(float3 Origin, float3 InvDirection, float TMin, float TMax, float3 BoxMin, float3 BoxMax)
+{
+	const float3 First = (BoxMin - Origin) * InvDirection;
+	const float3 Second = (BoxMax - Origin) * InvDirection;
+	const float3 Near = min(First, Second);
+	const float3 Far = max(First, Second);
+	const float Enter = max(max(Near.x, Near.y), max(Near.z, TMin));
+	const float Exit = min(min(Far.x, Far.y), min(Far.z, TMax));
+	return Exit >= Enter;
+}
+
+#include "/Plugins/PrototypeSWRTShadows/SWRTTriangle.ush"
+
+/** Any hit over one leaf's triangles. */
+bool AnyTriangleHit(uint FirstTriangle, uint NumTriangles, float3 Origin, float3 Direction, float TMin, float TMax)
+{
+	uint Local = 0;
+
+	// Two triangles a step, with all six loads issued before either test. A
+	// leaf holds two, so the pair is the ordinary case. Fetching one triangle
+	// and testing it at once leaves the warp waiting on a load it just asked
+	// for, and a leaf's triangles are next to each other in the buffer, so the
+	// second arrives for free with the first.
+	for (; Local + 2u <= NumTriangles; Local += 2u)
+	{
+		const uint BaseA = (FirstTriangle + Local) * 3;
+		const uint BaseB = (FirstTriangle + Local + 1u) * 3;
+
+		const float3 V0A = SWRTTriangles[BaseA + 0].xyz;
+		const float3 Edge1A = SWRTTriangles[BaseA + 1].xyz;
+		const float3 Edge2A = SWRTTriangles[BaseA + 2].xyz;
+
+		const float3 V0B = SWRTTriangles[BaseB + 0].xyz;
+		const float3 Edge1B = SWRTTriangles[BaseB + 1].xyz;
+		const float3 Edge2B = SWRTTriangles[BaseB + 2].xyz;
+
+#if SWRT_STATS
+		++GStatTriangles;
+#endif
+		if (RayHitsTriangleEdges(Origin, Direction, TMin, TMax, V0A, Edge1A, Edge2A))
+		{
+			return true;
+		}
+
+#if SWRT_STATS
+		++GStatTriangles;
+#endif
+		if (RayHitsTriangleEdges(Origin, Direction, TMin, TMax, V0B, Edge1B, Edge2B))
+		{
+			return true;
+		}
+	}
+
+	// A leaf with an odd count ends here.
+	if (Local < NumTriangles)
+	{
+#if SWRT_STATS
+		++GStatTriangles;
+#endif
+		const uint Base = (FirstTriangle + Local) * 3;
+		const float3 V0 = SWRTTriangles[Base + 0].xyz;
+		const float3 Edge1 = SWRTTriangles[Base + 1].xyz;
+		const float3 Edge2 = SWRTTriangles[Base + 2].xyz;
+
+		if (RayHitsTriangleEdges(Origin, Direction, TMin, TMax, V0, Edge1, Edge2))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+void DecodeNodeBounds(uint4 Node, out float3 BoxMin, out float3 BoxMax)
+{
+	BoxMin = float3(Node.x & 0xFFFFu, Node.x >> 16, Node.y & 0xFFFFu);
+	BoxMax = float3(Node.y >> 16, Node.z & 0xFFFFu, Node.z >> 16);
+}
+
+uint4 BlasNode(uint NodeIndex) { return SWRTNodes[NodeIndex]; }
+uint4 TlasNode(uint NodeIndex) { return SWRTInstanceNodes[NodeIndex]; }
+
+/**
+ * One source's BVH, in that source's local space.
+ *
+ * The stack holds DESCRIPTORS rather than node indices, so popping a node does
+ * not have to fetch it again to find out what it is. All four children are
+ * fetched unconditionally and the ones past Count are skipped, which turns four
+ * dependent loads into one.
+ *
+ * Children are pushed last to first, so the nearest child by build order comes
+ * off the stack first and a hit is found before its siblings are tested.
+ */
+bool TraverseSource(
+	uint RootDesc,
+	float3 Origin, float3 Direction, float TMin, float TMax,
+	float3 QuantOrigin, float3 QuantInvDirection)
+{
+	uint Stack[SWRT_STACK_SIZE];
+	uint StackTop = 0;
+	Stack[StackTop++] = RootDesc;
+
+	[loop]
+	while (StackTop > 0)
+	{
+		const uint Desc = Stack[--StackTop];
+
+#if SWRT_STATS
+		++GStatNodes;
+#endif
+
+		const uint First = Desc & SWRT_FIRST_MASK;
+		const uint Count = (Desc >> SWRT_COUNT_SHIFT) & SWRT_COUNT_MASK;
+
+		if ((Desc & SWRT_LEAF_BIT) != 0)
+		{
+			if (AnyTriangleHit(First, Count, Origin, Direction, TMin, TMax))
+			{
+				return true;
+			}
+		}
+		else
+		{
+			uint4 WideNodes[SWRT_MAX_ARITY];
+			UNROLL
+			for (uint Fetch = 0; Fetch < SWRT_MAX_ARITY; ++Fetch)
+			{
+				WideNodes[Fetch] = BlasNode(First + Fetch);
+			}
+
+			UNROLL
+			for (uint Slot = 0; Slot < SWRT_MAX_ARITY; ++Slot)
+			{
+				const uint Child = SWRT_MAX_ARITY - 1u - Slot;
+				if (Child >= Count)
+				{
+					continue;
+				}
+
+#if SWRT_STATS
+				++GStatBounds;
+				const bool bChildIsLeaf = (WideNodes[Child].w & SWRT_LEAF_BIT) != 0;
+				if (bChildIsLeaf)
+				{
+					++GStatLeafBounds;
+				}
+#endif
+
+				float3 ChildMin, ChildMax;
+				DecodeNodeBounds(WideNodes[Child], ChildMin, ChildMax);
+
+				if (RayHitsBounds(
+						QuantOrigin, QuantInvDirection, TMin, TMax, ChildMin, ChildMax))
+				{
+#if SWRT_STATS
+					if (bChildIsLeaf)
+					{
+						++GStatLeafAccept;
+					}
+#endif
+					if (StackTop < SWRT_STACK_SIZE)
+					{
+						Stack[StackTop++] = WideNodes[Child].w;
+#if SWRT_STATS
+						GStatMaxStack = max(GStatMaxStack, StackTop);
+#endif
+					}
+#if SWRT_STATS
+					else
+					{
+						++GStatStackOverflow;
+					}
+#endif
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+float TracePixel(int2 PixelPos)
+{
+	// The tile's list header is read before anything else, so the fetch is in
+	// flight while the depth, the cone test and the ray setup happen.
+	const uint2 PrefetchTile =
+		((uint2)PixelPos - SWRTPixelMin) / uint2(SWRT_TILE_X, SWRT_TILE_Y);
+	const uint PrefetchBase =
+		(PrefetchTile.y * SWRTTileGrid.x + PrefetchTile.x) * SWRTTileInstanceStride;
+	const uint PrefetchedHeader = SWRTTileInstances[PrefetchBase];
+
+	const float DeviceZ = SWRTSceneDepth.Load(int3(PixelPos, 0)).r;
+	if (DeviceZ <= 0.0f)
+	{
+		SWRT_SET_STAGE(SWRT_STAGE_NO_DEPTH);
+		return 1.0f;
+	}
+
+	const float3 SurfacePosition =
+		SvPositionToTranslatedWorld(float4((float2)PixelPos + 0.5f, DeviceZ, 1.0f)).xyz;
+
+	const float3 ToLight = SWRTLightPosition - SurfacePosition;
+	const float LightDistance = length(ToLight);
+	if (LightDistance <= 0.0f || LightDistance > SWRTLightRadius)
+	{
+		SWRT_SET_STAGE(SWRT_STAGE_OUT_OF_RANGE);
+		return 1.0f;
+	}
+
+	const float3 L = ToLight / LightDistance;
+	if (dot(-L, SWRTLightDirection) < SWRTCosOuterCone)
+	{
+		SWRT_SET_STAGE(SWRT_STAGE_OUT_OF_CONE);
+		return 1.0f;
+	}
+
+	// The surface came out of the depth buffer and does not land exactly on the
+	// triangle that wrote it, so a ray starting at zero shadows its own
+	// surface. The slope term is there because that error grows with distance.
+	const float TMin = SWRTRayStartBias + SWRTRayStartSlope * length(SurfacePosition);
+	const float TMax = LightDistance * 0.999f;
+	if (TMin >= TMax)
+	{
+		SWRT_SET_STAGE(SWRT_STAGE_DEGENERATE);
+		return 1.0f;
+	}
+
+#if SWRT_STATS
+	++GStatRays;
+	GStatStage = SWRT_STAGE_TRACED;
+#endif
+
+	const float3 InvDirection = 1.0f / L;
+
+	uint InstanceStack[SWRT_INSTANCE_STACK_SIZE];
+	uint InstanceStackTop = 0;
+
+	const uint TileBase = PrefetchBase;
+	const uint ListHeader = PrefetchedHeader;
+	const bool bUseList = (ListHeader & 0x80000000u) == 0u;
+	uint ListSlot = 0;
+
+	// Only the walk needs the ray in the top level's quantised frame. A tile
+	// with a list never builds it.
+	float3 QuantInvDirection = (float3)0.0f;
+	float3 QuantOrigin = (float3)0.0f;
+
+	BRANCH
+	if (!bUseList)
+	{
+		QuantInvDirection = InvDirection / SWRTQuantScale;
+		QuantOrigin = (SurfacePosition - SWRTSceneMin) * SWRTQuantScale;
+	}
+
+	if (!bUseList && SWRTCasterCount > 0)
+	{
+#if SWRT_STATS
+		++GStatInstanceBounds;
+#endif
+		const uint4 RootNodeData = TlasNode(SWRTInstanceRoot);
+		float3 RootMin, RootMax;
+		DecodeNodeBounds(RootNodeData, RootMin, RootMax);
+
+		if (RayHitsBounds(QuantOrigin, QuantInvDirection, TMin, TMax, RootMin, RootMax))
+		{
+			InstanceStack[InstanceStackTop++] = RootNodeData.w;
+		}
+	}
+
+	// One loop over both ways of producing placements: the list hands them out
+	// one at a time, the walk hands out a leaf's run at a time.
+	[loop]
+	while (true)
+	{
+		uint InstanceFirst;
+		uint InstanceCount;
+
+		BRANCH
+		if (bUseList)
+		{
+			if (ListSlot >= ListHeader)
+			{
+				break;
+			}
+			InstanceFirst = SWRTTileInstances[TileBase + 1u + ListSlot];
+			InstanceCount = 1u;
+			++ListSlot;
+		}
+		else
+		{
+			if (InstanceStackTop == 0)
+			{
+				break;
+			}
+
+			const uint InstanceDesc = InstanceStack[--InstanceStackTop];
+
+#if SWRT_STATS
+			++GStatInstanceNodes;
+#endif
+
+			InstanceFirst = InstanceDesc & SWRT_FIRST_MASK;
+
+			if ((InstanceDesc & SWRT_LEAF_BIT) == 0)
+			{
+				const uint ChildCount = (InstanceDesc >> SWRT_COUNT_SHIFT) & SWRT_COUNT_MASK;
+
+				uint4 WideInstanceNodes[SWRT_MAX_ARITY];
+				UNROLL
+				for (uint Fetch = 0; Fetch < SWRT_MAX_ARITY; ++Fetch)
+				{
+					WideInstanceNodes[Fetch] = TlasNode(InstanceFirst + Fetch);
+				}
+
+				UNROLL
+				for (uint Slot = 0; Slot < SWRT_MAX_ARITY; ++Slot)
+				{
+					const uint Child = SWRT_MAX_ARITY - 1u - Slot;
+					if (Child >= ChildCount)
+					{
+						continue;
+					}
+
+#if SWRT_STATS
+					++GStatInstanceBounds;
+#endif
+
+					float3 ChildMin, ChildMax;
+					DecodeNodeBounds(WideInstanceNodes[Child], ChildMin, ChildMax);
+
+					if (RayHitsBounds(QuantOrigin, QuantInvDirection, TMin, TMax, ChildMin, ChildMax))
+					{
+						if (InstanceStackTop < SWRT_INSTANCE_STACK_SIZE)
+						{
+							InstanceStack[InstanceStackTop++] = WideInstanceNodes[Child].w;
+#if SWRT_STATS
+							GStatMaxInstanceStack = max(GStatMaxInstanceStack, InstanceStackTop);
+#endif
+						}
+#if SWRT_STATS
+						else
+						{
+							++GStatStackOverflow;
+						}
+#endif
+					}
+				}
+				continue;
+			}
+
+			InstanceCount = (InstanceDesc >> SWRT_COUNT_SHIFT) & SWRT_COUNT_MASK;
+		}
+
+		for (uint LeafSlot = 0; LeafSlot < InstanceCount; ++LeafSlot)
+		{
+			const uint InstanceIndex = InstanceFirst + LeafSlot;
+
+#if SWRT_STATS
+			++GStatInstancesReached;
+			{
+				const uint MaskBit = InstanceIndex & (SWRT_TILE_MASK_WORDS * 32u - 1u);
+				InterlockedOr(GGroupInstanceMask[MaskBit >> 5], 1u << (MaskBit & 31u));
+			}
+#endif
+
+			const float4 InstanceA = SWRTInstances[InstanceIndex * 2 + 0];
+			const float4 InstanceB = SWRTInstances[InstanceIndex * 2 + 1];
+
+			// A listed placement has not been tested against this ray yet, only
+			// against the tile's bundle. A walked one already passed its node.
+			BRANCH
+			if (bUseList)
+			{
+#if SWRT_STATS
+				++GStatInstanceBounds;
+#endif
+				if (!RayHitsBounds(
+						SurfacePosition, InvDirection, TMin, TMax, InstanceA.xyz, InstanceB.xyz))
+				{
+					continue;
+				}
+			}
+
+#if SWRT_STATS
+			++GStatInstancesPassedBox;
+#endif
+
+			// Feedback for the host: this placement is worth keeping resident.
+			SWRTCasterHitsOut[InstanceIndex] = 1u;
+
+			// Negative means the source has no tree yet, so there is nothing to
+			// enter. Its box still counted, which is what keeps a source that
+			// is still building from flashing unshadowed.
+			if (InstanceB.w < 0.0f)
+			{
+				continue;
+			}
+
+			const float4 Row0 = SWRTInstanceTransforms[InstanceIndex * 5 + 0];
+			const float4 Row1 = SWRTInstanceTransforms[InstanceIndex * 5 + 1];
+			const float4 Row2 = SWRTInstanceTransforms[InstanceIndex * 5 + 2];
+			const float3 FrameMin = SWRTInstanceTransforms[InstanceIndex * 5 + 3].xyz;
+			const float3 FrameScale = SWRTInstanceTransforms[InstanceIndex * 5 + 4].xyz;
+
+			const float4 HomogeneousOrigin = float4(SurfacePosition, 1.0f);
+			const float4 HomogeneousDirection = float4(L, 0.0f);
+
+			const float3 LocalOrigin = float3(
+				dot(HomogeneousOrigin, Row0), dot(HomogeneousOrigin, Row1), dot(HomogeneousOrigin, Row2));
+			const float3 LocalDirection = float3(
+				dot(HomogeneousDirection, Row0), dot(HomogeneousDirection, Row1), dot(HomogeneousDirection, Row2));
+
+			const float3 InstanceQuantInvDirection = 1.0f / (LocalDirection * FrameScale);
+			const float3 InstanceQuantOrigin = (LocalOrigin - FrameMin) * FrameScale;
+
+			const uint InstanceRootNode = (uint)InstanceA.w;
+			const uint4 InstanceRootData = BlasNode(InstanceRootNode);
+
+			// The source's own root box, which is tighter than the placement's
+			// world box whenever the mesh does not fill its bounds.
+			{
+#if SWRT_STATS
+				++GStatBounds;
+#endif
+				float3 RootMin, RootMax;
+				DecodeNodeBounds(InstanceRootData, RootMin, RootMax);
+
+				if (!RayHitsBounds(
+						InstanceQuantOrigin, InstanceQuantInvDirection, TMin, TMax, RootMin, RootMax))
+				{
+					continue;
+				}
+			}
+
+#if SWRT_STATS
+			++GStatInstancesEntered;
+#endif
+
+			if (TraverseSource(
+					InstanceRootData.w,
+					LocalOrigin, LocalDirection, TMin, TMax,
+					InstanceQuantOrigin, InstanceQuantInvDirection))
+			{
+				return 0.0f;
+			}
+		}
+	}
+
+	return 1.0f;
+}
+
+#if SWRT_STATS
+groupshared uint GGroupWorkPlusOne[SWRT_GROUP_THREADS];
+groupshared uint GGroupInstanceBounds[SWRT_GROUP_THREADS];
+groupshared uint GGroupReached[SWRT_GROUP_THREADS];
+groupshared uint GGroupHit[SWRT_GROUP_THREADS];
+groupshared uint GGroupWarpMax[SWRT_GROUP_THREADS / 32];
+groupshared uint GGroupWarpLive[SWRT_GROUP_THREADS / 32];
+#endif
+
+float ShadeOnePixel(int2 PixelPos)
+{
+	const float Shadow = TracePixel(PixelPos);
+
+#if SWRT_STATS
+	GStatHit = (GStatRays > 0 && Shadow < 0.5f) ? 1u : 0u;
+#endif
+
+	return Shadow;
+}
+
+[numthreads(SWRT_GROUP_X, SWRT_GROUP_Y, 1)]
+void MainCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 GroupId : SV_GroupID)
+{
+	// Swizzled so groups running at the same time sit in the same part of the
+	// screen and read the same part of the BVH.
+	const uint2 TraceThreadId = ThreadGroupTilingX(
+		SWRTDispatchGrid,
+		uint2(SWRT_GROUP_X, SWRT_GROUP_Y),
+		SWRTSwizzleTileWidth,
+		GroupThreadId.xy,
+		GroupId.xy,
+		SWRTSwizzlePerfectTileCTAs,
+		SWRTSwizzleTotalPerfectCTAs,
+		SWRTSwizzleLastTileWidth,
+		SWRTSwizzleMagic,
+		SWRTSwizzleMagicShift);
+
+	const int2 PixelPos = (int2)SWRTPixelMin + (int2)TraceThreadId;
+	const bool bInRect = all(PixelPos < (int2)SWRTPixelMax);
+
+#if SWRT_STATS
+	const uint ClearLane = GroupThreadId.y * SWRT_GROUP_X + GroupThreadId.x;
+	if (ClearLane < SWRT_TILE_MASK_WORDS)
+	{
+		GGroupInstanceMask[ClearLane] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+#endif
+
+	// Out of rect threads cannot return early in the stats build: they still
+	// have to reach the group reductions below.
+#if !SWRT_STATS
+	if (!bInRect)
+	{
+		return;
+	}
+#endif
+
+	float Shadow = 1.0f;
+
+	BRANCH
+	if (bInRect)
+	{
+		Shadow = ShadeOnePixel(PixelPos);
+
+#if SWRT_STATS
+		// The heatmap writes a COST into the mask instead of a shadow, which
+		// the light shader false colours. The mask is one channel, so a number
+		// is all the trace can hand it.
+		BRANCH
+		if (SWRTHeatmapScale > 0.0f)
+		{
+			const float Iterations = (float)(GStatNodes + GStatInstanceNodes);
+			SWRTOutMask[PixelPos] = saturate(Iterations * SWRTHeatmapScale);
+		}
+		else
+#endif
+		{
+			SWRTOutMask[PixelPos] = Shadow;
+		}
+	}
+
+#if SWRT_STATS
+	if (GStatRays > 0)
+	{
+		InterlockedAdd(SWRTStats[0], GStatRays);
+		InterlockedAdd(SWRTStats[1], GStatNodes);
+		InterlockedAdd(SWRTStats[2], GStatBounds);
+		InterlockedAdd(SWRTStats[3], GStatTriangles);
+		InterlockedAdd(SWRTStats[4], GStatInstanceNodes);
+		InterlockedAdd(SWRTStats[5], GStatInstanceBounds);
+		InterlockedAdd(SWRTStats[6], GStatLeafBounds);
+		InterlockedAdd(SWRTStats[59], GStatLeafAccept);
+		InterlockedMax(SWRTStats[7], GStatMaxStack);
+		InterlockedMax(SWRTStats[8], GStatMaxInstanceStack);
+		InterlockedAdd(SWRTStats[9], GStatStackOverflow);
+		InterlockedAdd(SWRTStats[10], GStatInstancesReached);
+		InterlockedAdd(SWRTStats[11], GStatInstancesEntered);
+		InterlockedAdd(SWRTStats[38], GStatInstancesPassedBox);
+	}
+
+	InterlockedAdd(SWRTStats[39 + min(GStatStage, SWRT_STAGE_COUNT - 1u)], 1u);
+
+	// Hit and miss rays are costed separately, because which of the two carries
+	// the work decides what is worth optimising.
+	if (GStatRays > 0)
+	{
+		const uint RayWork = GStatNodes + GStatInstanceNodes;
+
+		BRANCH
+		if (GStatHit != 0u)
+		{
+			InterlockedAdd(SWRTStats[46], 1u);
+			InterlockedAdd(SWRTStats[47], RayWork);
+			InterlockedAdd(SWRTStats[49], GStatTriangles);
+		}
+		else
+		{
+			InterlockedAdd(SWRTStats[48], RayWork);
+			InterlockedAdd(SWRTStats[50], GStatTriangles);
+		}
+	}
+
+	const uint WorkThisRay = GStatNodes + GStatInstanceNodes;
+
+	if (GStatRays > 0)
+	{
+		uint Bucket = 0;
+		if (WorkThisRay >= 129u)     { Bucket = 7; }
+		else if (WorkThisRay >= 65u) { Bucket = 6; }
+		else if (WorkThisRay >= 33u) { Bucket = 5; }
+		else if (WorkThisRay >= 17u) { Bucket = 4; }
+		else if (WorkThisRay >= 9u)  { Bucket = 3; }
+		else if (WorkThisRay >= 5u)  { Bucket = 2; }
+		else if (WorkThisRay >= 1u)  { Bucket = 1; }
+		InterlockedAdd(SWRTStats[19 + Bucket], 1u);
+	}
+
+	// Work plus one, so zero can mean a lane that never traced.
+	const uint LaneIndex = GroupThreadId.y * SWRT_GROUP_X + GroupThreadId.x;
+	GGroupWorkPlusOne[LaneIndex] = (GStatRays > 0) ? (WorkThisRay + 1u) : 0u;
+	GGroupInstanceBounds[LaneIndex] = GStatInstanceBounds;
+	GGroupReached[LaneIndex] = GStatInstancesReached;
+	GGroupHit[LaneIndex] = GStatHit;
+	GroupMemoryBarrierWithGroupSync();
+
+	// Per warp, because a warp is what finishes together. Lane efficiency
+	// factors into how many lanes were live times how evenly they finished, and
+	// the two have different answers.
+	BRANCH
+	if (LaneIndex < (SWRT_GROUP_THREADS / 32u))
+	{
+		const uint WarpBase = LaneIndex * 32u;
+		uint WarpMax = 0;
+		uint WarpSum = 0;
+		uint WarpLive = 0;
+		uint WarpHits = 0;
+
+		for (uint Lane = 0; Lane < 32u; ++Lane)
+		{
+			const uint Stored = GGroupWorkPlusOne[WarpBase + Lane];
+			if (Stored == 0u)
+			{
+				continue;
+			}
+
+			const uint Work = Stored - 1u;
+			++WarpLive;
+			WarpSum += Work;
+			WarpMax = max(WarpMax, Work);
+			WarpHits += GGroupHit[WarpBase + Lane];
+		}
+
+		GGroupWarpMax[LaneIndex] = WarpMax;
+		GGroupWarpLive[LaneIndex] = WarpLive;
+
+		if (WarpLive > 0)
+		{
+			InterlockedAdd(SWRTStats[51], 1u);
+			InterlockedAdd(SWRTStats[52], WarpMax);
+			InterlockedAdd(SWRTStats[53], WarpSum);
+			InterlockedAdd(SWRTStats[54], WarpLive);
+
+			if (WarpHits == WarpLive) { InterlockedAdd(SWRTStats[55], 1u); }
+			else if (WarpHits == 0u)  { InterlockedAdd(SWRTStats[56], 1u); }
+			else                      { InterlockedAdd(SWRTStats[57], 1u); }
+
+			InterlockedAdd(SWRTStats[58], 32u - WarpLive);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// The three views r.SWRTSpotLight.Debug can ask for, written as a number
+	// that the light shader turns into colour.
+	BRANCH
+	if (SWRTDebugView != SWRT_VIEW_OFF && bInRect)
+	{
+		const uint WarpIndex = LaneIndex >> 5;
+		const uint WarpMaxWork = GGroupWarpMax[WarpIndex];
+		const uint WarpLiveLanes = GGroupWarpLive[WarpIndex];
+		const bool bTraced = (GStatRays > 0);
+		const uint RayWork = GStatNodes + GStatInstanceNodes;
+
+		float Value = 0.0f;
+
+		if (SWRTDebugView == SWRT_VIEW_NODES)
+		{
+			Value = saturate((float)RayWork * SWRTHeatmapScale);
+		}
+		else if (SWRTDebugView == SWRT_VIEW_LANE_WASTE)
+		{
+			// This lane's work over what its warp waited for.
+			Value = (bTraced && WarpMaxWork > 0u)
+				? ((float)RayWork / (float)WarpMaxWork)
+				: 0.0f;
+		}
+		else if (SWRTDebugView == SWRT_VIEW_WARP_MIXED)
+		{
+			uint WarpHits = 0;
+			for (uint Lane = 0; Lane < 32u; ++Lane)
+			{
+				const uint Slot = (WarpIndex << 5) + Lane;
+				if (GGroupWorkPlusOne[Slot] != 0u)
+				{
+					WarpHits += GGroupHit[Slot];
+				}
+			}
+
+			const bool bMixed =
+				WarpLiveLanes > 0u && WarpHits > 0u && WarpHits < WarpLiveLanes;
+			Value = bMixed ? 1.0f : 0.0f;
+		}
+
+		SWRTOutMask[PixelPos] = Value;
+	}
+
+	// One lane reduces the group: divergence, how much of the top level the
+	// whole tile shared, and how long its instance list was.
+	BRANCH
+	if (LaneIndex == 0)
+	{
+		uint LiveLanes = 0;
+		uint WorkSum = 0;
+		uint WorkMax = 0;
+		uint BoundsMin = 0xFFFFFFFFu;
+		uint BoundsMax = 0;
+		uint ReachedSum = 0;
+
+		for (uint Lane = 0; Lane < SWRT_GROUP_THREADS; ++Lane)
+		{
+			const uint Stored = GGroupWorkPlusOne[Lane];
+			if (Stored == 0u)
+			{
+				continue;
+			}
+
+			const uint Work = Stored - 1u;
+			const uint Bounds = GGroupInstanceBounds[Lane];
+
+			++LiveLanes;
+			WorkSum += Work;
+			WorkMax = max(WorkMax, Work);
+			BoundsMin = min(BoundsMin, Bounds);
+			BoundsMax = max(BoundsMax, Bounds);
+			ReachedSum += GGroupReached[Lane];
+		}
+
+		if (LiveLanes > 0)
+		{
+			InterlockedAdd(SWRTStats[13], WorkMax);
+			InterlockedAdd(SWRTStats[14], 1u);
+			InterlockedAdd(SWRTStats[15], WorkSum);
+			InterlockedAdd(SWRTStats[16], LiveLanes);
+			InterlockedAdd(SWRTStats[17], BoundsMin);
+			InterlockedAdd(SWRTStats[18], BoundsMax);
+
+			if (ReachedSum > 0)
+			{
+				InterlockedAdd(SWRTStats[27], 1u);
+			}
+
+			uint UnionSize = 0;
+			for (uint Word = 0; Word < SWRT_TILE_MASK_WORDS; ++Word)
+			{
+				UnionSize += countbits(GGroupInstanceMask[Word]);
+			}
+			InterlockedAdd(SWRTStats[28], UnionSize);
+			InterlockedMax(SWRTStats[29], UnionSize);
+
+			{
+				const uint2 ListTile =
+					((uint2)PixelPos - SWRTPixelMin) / uint2(SWRT_TILE_X, SWRT_TILE_Y);
+				const uint ListHeaderWord =
+					SWRTTileInstances[(ListTile.y * SWRTTileGrid.x + ListTile.x)
+						* SWRTTileInstanceStride];
+
+				const uint ListLength = (ListHeaderWord & 0x80000000u) != 0u
+					? SWRTCasterCount : ListHeaderWord;
+
+				uint ListBucket = 0;
+				if (ListLength >= 65u)      { ListBucket = 7; }
+				else if (ListLength >= 33u) { ListBucket = 6; }
+				else if (ListLength >= 17u) { ListBucket = 5; }
+				else if (ListLength >= 9u)  { ListBucket = 4; }
+				else if (ListLength >= 5u)  { ListBucket = 3; }
+				else if (ListLength >= 3u)  { ListBucket = 2; }
+				else if (ListLength >= 1u)  { ListBucket = 1; }
+
+				InterlockedAdd(SWRTStats[30 + ListBucket], 1u);
+			}
+		}
+	}
+#endif
+}

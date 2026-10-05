@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Which placements one 8x8 tile's rays can reach, written as a short list the
+// trace reads instead of walking the top level per ray.
+//
+// One thread per tile. The tile's rays all end at the bulb and start inside the
+// box SWRTTileBoundsCS found, so they form a BUNDLE: a box of origins and a
+// cone of directions. Testing that bundle against a node is conservative, so
+// the list can hold a placement no ray actually hits, but never miss one that
+// a ray does.
+//
+// The header word in front of each list is the count, or the high bit set to
+// mean fall back to the full top level walk. A list is a shortcut and never a
+// cull: an overflow or a bundle too wide to be useful costs the walk, not a
+// shadow.
+
+#include "/Engine/Private/Common.ush"
+
+Buffer<uint4> SWRTTiNodes;
+uint SWRTTiInstanceRoot;
+uint SWRTTiCasterCount;
+
+/** Two float4 a tile: minimum with the usable flag in w, then maximum. */
+Buffer<float4> SWRTTiBounds;
+
+RWBuffer<uint> SWRTTiOutInstances;
+uint SWRTTiStride;
+
+uint2  SWRTTiTileGrid;
+float3 SWRTTiSceneMin;
+float3 SWRTTiQuantScale;
+float3 SWRTTiLightPosition;
+
+#define SWRT_TI_FIRST_MASK  0x01FFFFFFu
+#define SWRT_TI_COUNT_SHIFT 25
+#define SWRT_TI_COUNT_MASK  0x3Fu
+#define SWRT_TI_LEAF_BIT    0x80000000u
+
+#define SWRT_TI_STACK_SIZE 32
+#define SWRT_TI_GROUP_SIZE 64
+
+void DecodeNodeBounds(uint4 Node, out float3 BoxMin, out float3 BoxMax)
+{
+	BoxMin = float3(Node.x & 0xFFFFu, Node.x >> 16, Node.y & 0xFFFFu);
+	BoxMax = float3(Node.y >> 16, Node.z & 0xFFFFu, Node.z >> 16);
+}
+
+/**
+ * Slab test for a whole bundle: four products an axis, because both the origin
+ * and the inverse direction are intervals. An axis the bundle straddles is
+ * skipped, since the reciprocal there spans infinity and the slab says nothing.
+ */
+bool BundleHitsBounds(
+	float3 OLo, float3 OHi, float3 ILo, float3 IHi, bool3 Straddle,
+	float3 BoxMin, float3 BoxMax)
+{
+	float Enter = 0.0f;
+	float Exit = 1.0f;
+
+	UNROLL
+	for (uint Axis = 0; Axis < 3; ++Axis)
+	{
+		if (Straddle[Axis])
+		{
+			continue;
+		}
+
+		const float NLo = BoxMin[Axis] - OHi[Axis];
+		const float NHi = BoxMax[Axis] - OLo[Axis];
+
+		const float4 T = float4(
+			NLo * ILo[Axis], NLo * IHi[Axis],
+			NHi * ILo[Axis], NHi * IHi[Axis]);
+
+		Enter = max(Enter, min(min(T.x, T.y), min(T.z, T.w)));
+		Exit = min(Exit, max(max(T.x, T.y), max(T.z, T.w)));
+	}
+
+	return Exit >= Enter;
+}
+
+[numthreads(SWRT_TI_GROUP_SIZE, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint TileIndex = DispatchThreadId.x;
+	if (TileIndex >= SWRTTiTileGrid.x * SWRTTiTileGrid.y)
+	{
+		return;
+	}
+
+	const uint OutBase = TileIndex * SWRTTiStride;
+
+	const float4 BoundsA = SWRTTiBounds[TileIndex * 2 + 0];
+	const float4 BoundsB = SWRTTiBounds[TileIndex * 2 + 1];
+
+	// Nothing in the tile casts a ray.
+	if (BoundsA.w == 0.0f || SWRTTiCasterCount == 0)
+	{
+		SWRTTiOutInstances[OutBase] = 0u;
+		return;
+	}
+
+	// Quantised space, the same one the node bounds are in.
+	const float3 OLo = (BoundsA.xyz - SWRTTiSceneMin) * SWRTTiQuantScale;
+	const float3 OHi = (BoundsB.xyz - SWRTTiSceneMin) * SWRTTiQuantScale;
+	const float3 QLight = (SWRTTiLightPosition - SWRTTiSceneMin) * SWRTTiQuantScale;
+
+	const float3 DLo = QLight - OHi;
+	const float3 DHi = QLight - OLo;
+
+	const bool3 Straddle = bool3(
+		DLo.x <= 0.0f && DHi.x >= 0.0f,
+		DLo.y <= 0.0f && DHi.y >= 0.0f,
+		DLo.z <= 0.0f && DHi.z >= 0.0f);
+
+	const float3 RLo = 1.0f / DLo;
+	const float3 RHi = 1.0f / DHi;
+	const float3 ILo = min(RLo, RHi);
+	const float3 IHi = max(RLo, RHi);
+
+	uint Stack[SWRT_TI_STACK_SIZE];
+	uint StackTop = 0;
+	uint Count = 0;
+	bool bOverflow = false;
+
+	{
+		float3 RootMin, RootMax;
+		DecodeNodeBounds(SWRTTiNodes[SWRTTiInstanceRoot], RootMin, RootMax);
+		if (BundleHitsBounds(OLo, OHi, ILo, IHi, Straddle, RootMin, RootMax))
+		{
+			Stack[StackTop++] = SWRTTiInstanceRoot;
+		}
+	}
+
+	[loop]
+	while (StackTop > 0 && !bOverflow)
+	{
+		const uint NodeIndex = Stack[--StackTop];
+		const uint4 Node = SWRTTiNodes[NodeIndex];
+
+		const uint Desc = Node.w;
+		const uint First = Desc & SWRT_TI_FIRST_MASK;
+		const uint ChildCount = (Desc >> SWRT_TI_COUNT_SHIFT) & SWRT_TI_COUNT_MASK;
+
+		if ((Desc & SWRT_TI_LEAF_BIT) != 0u)
+		{
+			for (uint LeafSlot = 0; LeafSlot < ChildCount; ++LeafSlot)
+			{
+				if (Count + 1u >= SWRTTiStride)
+				{
+					bOverflow = true;
+					break;
+				}
+				SWRTTiOutInstances[OutBase + 1u + Count] = First + LeafSlot;
+				++Count;
+			}
+			continue;
+		}
+
+		[loop]
+		for (uint Child = 0; Child < ChildCount; ++Child)
+		{
+			const uint ChildIndex = First + Child;
+
+			float3 ChildMin, ChildMax;
+			DecodeNodeBounds(SWRTTiNodes[ChildIndex], ChildMin, ChildMax);
+
+			if (BundleHitsBounds(OLo, OHi, ILo, IHi, Straddle, ChildMin, ChildMax))
+			{
+				if (StackTop < SWRT_TI_STACK_SIZE)
+				{
+					Stack[StackTop++] = ChildIndex;
+				}
+				else
+				{
+					bOverflow = true;
+					break;
+				}
+			}
+		}
+	}
+
+	SWRTTiOutInstances[OutBase] = bOverflow ? 0x80000000u : Count;
+}

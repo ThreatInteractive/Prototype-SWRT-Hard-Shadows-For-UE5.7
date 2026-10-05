@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The world bound of one 8x8 tile's shadow rays: the box around every lit
+// surface point in the tile.
+//
+// One group per tile, one thread per pixel. A pixel contributes only if it has
+// depth, is inside the light's reach and is inside the cone, so the bound
+// covers exactly the rays the trace will cast. SWRTTileInstanceCS then tests
+// that box against the top level once for the whole tile instead of once per
+// ray.
+//
+// The reduction goes through groupshared integers because HLSL has no float
+// atomic minimum. Positions are encoded as fixed point with a bias, which keeps
+// the integer ordering the same as the float ordering for negative values too.
+//
+// Permutations:
+//   SWRT_TB_EXACT_GRID  the traced rect is a whole number of tiles, so the
+//                       bounds checks on both the load and the write go away
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D<float> SWRTTbSceneDepth;
+RWBuffer<float4> SWRTTbOutBounds;
+
+uint2  SWRTTbPixelMin;
+uint2  SWRTTbPixelMax;
+uint2  SWRTTbTileGrid;
+
+float3 SWRTTbLightPosition;
+float  SWRTTbLightRadius;
+float3 SWRTTbLightDirection;
+float  SWRTTbCosOuterCone;
+
+#ifndef SWRT_TB_EXACT_GRID
+	#define SWRT_TB_EXACT_GRID 0
+#endif
+
+#define SWRT_TB_GROUP_X 8
+#define SWRT_TB_GROUP_Y 8
+
+// A sixty fourth of a world unit, which is finer than the box ever needs to be.
+#define SWRT_TB_FIXED_SCALE 64.0f
+#define SWRT_TB_FIXED_BIAS  0x00800000u
+
+groupshared uint GTileMin[3];
+groupshared uint GTileMax[3];
+
+uint EncodeFloorFixed(float Value)
+{
+	return (uint)((int)floor(Value * SWRT_TB_FIXED_SCALE) + (int)SWRT_TB_FIXED_BIAS);
+}
+
+uint EncodeCeilFixed(float Value)
+{
+	return (uint)((int)ceil(Value * SWRT_TB_FIXED_SCALE) + (int)SWRT_TB_FIXED_BIAS);
+}
+
+float DecodeFixed(uint Value)
+{
+	return (float)((int)Value - (int)SWRT_TB_FIXED_BIAS) / SWRT_TB_FIXED_SCALE;
+}
+
+[numthreads(SWRT_TB_GROUP_X, SWRT_TB_GROUP_Y, 1)]
+void MainCS(
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 GroupId : SV_GroupID)
+{
+	const uint Lane = GroupThreadId.y * SWRT_TB_GROUP_X + GroupThreadId.x;
+
+	if (Lane < 3u)
+	{
+		GTileMin[Lane] = 0xFFFFFFFFu;
+		GTileMax[Lane] = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	const int2 PixelPos = (int2)SWRTTbPixelMin + (int2)DispatchThreadId.xy;
+
+#if SWRT_TB_EXACT_GRID
+	const float DeviceZ = SWRTTbSceneDepth.Load(int3(PixelPos, 0)).r;
+#else
+	const float DeviceZ = all(PixelPos < (int2)SWRTTbPixelMax)
+		? SWRTTbSceneDepth.Load(int3(PixelPos, 0)).r : 0.0f;
+#endif
+
+	uint3 LocalMin = (uint3)0xFFFFFFFFu;
+	uint3 LocalMax = (uint3)0u;
+	bool bContributed = false;
+
+	if (DeviceZ > 0.0f)
+	{
+		const float3 SurfacePosition =
+			SvPositionToTranslatedWorld(float4((float2)PixelPos + 0.5f, DeviceZ, 1.0f)).xyz;
+
+		const float3 ToLight = SWRTTbLightPosition - SurfacePosition;
+		const float DistanceSq = dot(ToLight, ToLight);
+
+		if (DistanceSq > 0.0f && DistanceSq <= SWRTTbLightRadius * SWRTTbLightRadius)
+		{
+			const float3 L = ToLight * rsqrt(DistanceSq);
+			if (dot(-L, SWRTTbLightDirection) >= SWRTTbCosOuterCone)
+			{
+				LocalMin = uint3(
+					EncodeFloorFixed(SurfacePosition.x),
+					EncodeFloorFixed(SurfacePosition.y),
+					EncodeFloorFixed(SurfacePosition.z));
+				LocalMax = uint3(
+					EncodeCeilFixed(SurfacePosition.x),
+					EncodeCeilFixed(SurfacePosition.y),
+					EncodeCeilFixed(SurfacePosition.z));
+				bContributed = true;
+			}
+		}
+	}
+
+	BRANCH
+	if (bContributed)
+	{
+		InterlockedMin(GTileMin[0], LocalMin.x);
+		InterlockedMin(GTileMin[1], LocalMin.y);
+		InterlockedMin(GTileMin[2], LocalMin.z);
+		InterlockedMax(GTileMax[0], LocalMax.x);
+		InterlockedMax(GTileMax[1], LocalMax.y);
+		InterlockedMax(GTileMax[2], LocalMax.z);
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (Lane == 0u)
+	{
+		const uint2 TileXY = GroupId.xy;
+
+#if !SWRT_TB_EXACT_GRID
+		if (TileXY.x < SWRTTbTileGrid.x && TileXY.y < SWRTTbTileGrid.y)
+#endif
+		{
+			const uint TileIndex = TileXY.y * SWRTTbTileGrid.x + TileXY.x;
+
+			// Untouched minimum means no pixel in the tile casts a ray.
+			const bool bTileAny = GTileMin[0] != 0xFFFFFFFFu;
+
+			const float3 BoundsMin = float3(
+				DecodeFixed(GTileMin[0]), DecodeFixed(GTileMin[1]), DecodeFixed(GTileMin[2]));
+			const float3 BoundsMax = float3(
+				DecodeFixed(GTileMax[0]), DecodeFixed(GTileMax[1]), DecodeFixed(GTileMax[2]));
+
+			// 1 there is something to trace, 0 there is not.
+			const float Usable = bTileAny ? 1.0f : 0.0f;
+
+			SWRTTbOutBounds[TileIndex * 2 + 0] = float4(BoundsMin, Usable);
+			SWRTTbOutBounds[TileIndex * 2 + 1] = float4(BoundsMax, 0.0f);
+		}
+	}
+}

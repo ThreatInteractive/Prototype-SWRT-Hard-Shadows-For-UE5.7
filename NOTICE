@@ -1,0 +1,81 @@
+PrototypeSWRTShadows
+Copyright 2026 Kevin Jimenez
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License in the LICENSE file beside this one, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+This NOTICE file must be included with any redistribution of this software, in
+source or in binary form, as section 4 of the License requires.
+
+
+THIRD PARTY WORK
+================
+
+THE FORGE
+---------
+
+Copyright (c) 2017 to the present, The Forge Interactive Inc.
+Licensed under the Apache License, Version 2.0.
+https://github.com/ConfettiFX/The-Forge
+
+WHAT IS DERIVED FROM IT
+
+  The triangle layout. A triangle is stored as three float4, holding the first
+  vertex and both edges rather than three loose vertices:
+
+      element 0 = v0
+      element 1 = v1 minus v0
+      element 2 = v2 minus v0
+
+  so the traversal reads a triangle as three vector loads instead of nine
+  scalar ones, and the ray triangle test gets its edges already subtracted.
+  This comes from The Forge's hybrid ray tracing sample, 09a_HybridRaytracing,
+  which is present in tag v1.45 and has since been removed from their main
+  branch.
+
+  Two traversal choices from the same sample: testing an instance's own root
+  box before entering it, and pushing a node's children so that one chosen
+  child is tested before its siblings. Which child that is, is decided by this
+  plugin's own build.
+
+  In this plugin those appear in Shaders/SWRTTriangleExtractCS.usf,
+  Shaders/SWRTTraceCS.usf, Shaders/SWRTBVHBoundsCS.usf and the triangle
+  handling in Source/PrototypeSWRTShadows/Private/SWRTSoftwareTrace.cpp. The
+  code is written for this plugin and is not a copy of theirs; what was taken
+  is the layout and those two traversal decisions.
+
+  The Forge is under the same licence as this plugin, so nothing further is
+  needed beyond keeping this notice.
+
+
+UNREAL ENGINE
+-------------
+
+This reference implementation is written for Unreal Engine. It calls engine 
+rendering interfaces and includes engine shader headers, which carries no 
+condition beyond the Engine licence those users already hold.
+
+It contains no transcribed Unreal Engine source. Developers porting this work 
+to other engines or custom renderers are free to replace these engine-specific 
+interfaces with their own implementations under the Apache 2.0 terms of this project.
+
+There are four places wherethis plugin has to agree with the engine, because a light 
+from this plugin and an engine spot light are meant to be comparable side by side:
+
+  which lights are drawn and how they fade   IsSWRTSpotLightVisibleInView
+  which primitives cast shadows              SWRTCasterGather.cpp
+  how a light's parameters are packed        FillLightParameters
+  the shade itself                           SWRTSpotLightPS.usf
+
+The first three are reimplemented from the same quantities, so the behaviour
+matches while the code is this plugin's own. The fourth includes the engine's
+DeferredLightingCommon.ush and calls GetDynamicLighting, which is calling an
+interface rather than copying one.

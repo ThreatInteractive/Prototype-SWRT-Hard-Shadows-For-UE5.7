@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Dispatch swizzle: remaps a group's id so consecutive groups land in a tile
+// of the screen rather than along a scanline. Groups that run at the same time
+// then read the same part of the BVH, which is what the L2 hit rate depends on.
+//
+// The divides are all by values the host knows, so each one is handed a
+// multiply and a shift instead.
+
+#pragma once
+
+uint SWRTTileDivide(uint N, uint D, uint Magic, uint Shift)
+{
+	if (Magic == 0u)
+	{
+		return N / D;
+	}
+	return (N * Magic) >> Shift;
+}
+
+/**
+ * MaxTileWidth is the swizzle tile's width in GROUPS. PerfectTileCTAs,
+ * TotalPerfectCTAs, LastTileWidth, Magic and MagicShift all come from the host,
+ * which solves them once per dispatch.
+ */
+uint2 ThreadGroupTilingX(
+	const uint2 DispatchGridDim,
+	const uint2 CtaDim,
+	const uint MaxTileWidth,
+	const uint2 GroupThreadID,
+	const uint2 GroupId,
+	const uint PerfectTileCTAs,
+	const uint TotalPerfectCTAs,
+	const uint LastTileWidth,
+	const uint3 Magic,
+	const uint3 MagicShift)
+{
+	const uint FlatGroupId = DispatchGridDim.x * GroupId.y + GroupId.x;
+
+	const uint TileId = SWRTTileDivide(FlatGroupId, PerfectTileCTAs, Magic.x, MagicShift.x);
+	const uint LocalId = FlatGroupId - TileId * PerfectTileCTAs;
+
+	uint LocalY;
+	uint LocalX;
+
+	// The last tile in a row is narrower whenever the grid width is not a
+	// multiple of the tile width, so it gets its own divisor.
+	if (TotalPerfectCTAs <= FlatGroupId)
+	{
+		LocalY = SWRTTileDivide(LocalId, LastTileWidth, Magic.z, MagicShift.z);
+		LocalX = LocalId - LocalY * LastTileWidth;
+	}
+	else
+	{
+		LocalY = SWRTTileDivide(LocalId, MaxTileWidth, Magic.y, MagicShift.y);
+		LocalX = LocalId - LocalY * MaxTileWidth;
+	}
+
+	const uint2 SwizzledGroupId = uint2(TileId * MaxTileWidth + LocalX, LocalY);
+
+	return uint2(
+		CtaDim.x * SwizzledGroupId.x + GroupThreadID.x,
+		CtaDim.y * SwizzledGroupId.y + GroupThreadID.y);
+}

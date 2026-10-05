@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// The SWRT spot light shade.
+//
+// The BRDF, the falloff, the cone attenuation and the contact shadow all come
+// from the engine through GetDynamicLighting in DeferredLightingCommon.ush, so
+// this file holds no lighting maths of its own. What it adds is the shadow
+// term: one traced ray per pixel, read out of the mask the compute trace wrote.
+//
+// Permutations:
+//   SWRT_SHADOWED  0 when nothing could be traced this frame, which shades the
+//                  light unshadowed.
+
+#define SUPPORT_CONTACT_SHADOWS 1
+
+#include "/Engine/Private/HairStrands/HairStrandsVisibilityCommonStruct.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/DeferredLightingCommon.ush"
+
+#ifndef SWRT_SHADOWED
+	#define SWRT_SHADOWED 0
+#endif
+
+float3 SWRTLightTranslatedWorldPosition;
+float  SWRTLightInvRadius;
+float3 SWRTLightColor;
+float  SWRTLightFalloffExponent;
+float3 SWRTLightDirection;
+float3 SWRTLightTangent;
+float2 SWRTLightSpotAngles;
+float  SWRTLightSourceRadius;
+float  SWRTLightSoftSourceRadius;
+float  SWRTLightSourceLength;
+float  SWRTLightSpecularScale;
+float  SWRTLightDiffuseScale;
+float  SWRTContactShadowLength;
+float  SWRTContactShadowCastingIntensity;
+float  SWRTContactShadowNonCastingIntensity;
+uint   SWRTShadowedBits;
+
+/**
+ * Shadow mask, 0 shadowed and 1 lit, one value per screen pixel.
+ *
+ * Read with Load and not a sampler: it is already at screen resolution and
+ * there is exactly one value per pixel, so filtering would invent intermediate
+ * values for a term that is binary by construction.
+ */
+Texture2D<float> SWRTShadowMask;
+
+/**
+ * r.SWRTSpotLight.Debug. Nonzero means the mask holds a MEASUREMENT rather
+ * than a shadow term, except for mode 1 which false colours the real term.
+ * The mask is one channel, so the trace can only write a number into it and
+ * the colour has to be made here; left as a shadow term a measurement simply
+ * darkens the scene.
+ */
+uint SWRTDebugMode;
+
+FDeferredLightData InitSWRTLightData()
+{
+	FDeferredLightData LightData = (FDeferredLightData)0;
+	LightData.TranslatedWorldPosition = SWRTLightTranslatedWorldPosition;
+	LightData.InvRadius = SWRTLightInvRadius;
+	LightData.Color = SWRTLightColor;
+	LightData.FalloffExponent = SWRTLightFalloffExponent;
+	LightData.Direction = SWRTLightDirection;
+	LightData.Tangent = SWRTLightTangent;
+	LightData.SpotAngles = SWRTLightSpotAngles;
+	LightData.SourceRadius = SWRTLightSourceRadius;
+	LightData.SoftSourceRadius = SWRTLightSoftSourceRadius;
+	LightData.SourceLength = SWRTLightSourceLength;
+	LightData.SpecularScale = SWRTLightSpecularScale;
+	LightData.DiffuseScale = SWRTLightDiffuseScale;
+	LightData.ContactShadowLength = abs(SWRTContactShadowLength);
+	LightData.ContactShadowLengthInWS = SWRTContactShadowLength < 0.0f;
+	LightData.ContactShadowCastingIntensity = SWRTContactShadowCastingIntensity;
+	LightData.ContactShadowNonCastingIntensity = SWRTContactShadowNonCastingIntensity;
+	LightData.DistanceFadeMAD = 0;
+	LightData.ShadowMapChannelMask = 0;
+	LightData.ShadowedBits = SWRTShadowedBits;
+	LightData.bInverseSquared = SWRTLightFalloffExponent == 0;
+	LightData.bRadialLight = true;
+	LightData.bSpotLight = true;
+	LightData.bRectLight = false;
+	LightData.RectLightData.BarnCosAngle = 0;
+	LightData.RectLightData.BarnLength = -2.0f;
+	LightData.IESAtlasIndex = -1;
+	LightData.LightFunctionAtlasLightIndex = 0;
+	LightData.HairTransmittance = InitHairTransmittanceData();
+	LightData.bAffectsTranslucentLighting = 0;
+	return LightData;
+}
+
+/**
+ * Turbo, for the views that are a fraction. Brightness rises with the value as
+ * well as hue, so it stays readable in greyscale and after compression.
+ */
+float3 SWRTTurbo(float T)
+{
+	float3 Colour;
+	Colour.r = saturate(1.30f * T * T * (3.0f - 2.0f * T) - 0.10f);
+	Colour.g = saturate(sin(T * 3.14159f) * 1.05f);
+	Colour.b = saturate(1.10f * (1.0f - T) * (1.0f - T) * (1.0f + 2.0f * T) - 0.05f);
+
+	// A dead lane and an unlit pixel both read zero, and the difference matters
+	// in the lane waste view, so the darkest end is floored onto a visible blue.
+	return max(Colour, float3(0.03f, 0.03f, 0.12f));
+}
+
+/** False colour for whichever debug view is on. Returns true when it wrote one. */
+bool SWRTDebugColour(float Value, out float3 OutColour)
+{
+	OutColour = 0;
+
+	const float V = saturate(Value);
+
+	if (SWRTDebugMode == 1)
+	{
+		// The shadow term itself: green where the light reaches, red where it
+		// is blocked.
+		OutColour = float3(1.0f - V, V, 0);
+		return true;
+	}
+
+	if (SWRTDebugMode == 3)
+	{
+		// Node visits a ray, normalised by HeatmapRange. Blue to green to red
+		// to white, so both the cheap tail and the expensive tail are readable.
+		const float3 Cold = lerp(float3(0, 0, 1), float3(0, 1, 0), saturate(V * 3.0f));
+		const float3 Warm = lerp(Cold, float3(1, 0, 0), saturate(V * 3.0f - 1.0f));
+		OutColour = lerp(Warm, float3(1, 1, 1), saturate(V * 3.0f - 2.0f));
+		return true;
+	}
+
+	if (SWRTDebugMode == 4)
+	{
+		// Coherent warps go dark. Magenta is the only part a ray sort could
+		// ever improve, so a nearly dark screen means sorting is dead before it
+		// is built.
+		OutColour = V > 0.5f ? float3(1.00f, 0.00f, 0.85f) : float3(0.08f, 0.09f, 0.14f);
+		return true;
+	}
+
+	if (SWRTDebugMode == 2)
+	{
+		// Lane waste, a fraction.
+		OutColour = SWRTTurbo(V);
+		return true;
+	}
+
+	return false;
+}
+
+void ShadeSWRTSpotLight(float4 SVPos, out float4 OutColor)
+{
+	OutColor = 0;
+
+	const float2 ScreenUV = SVPos.xy * View.BufferSizeAndInvSize.zw;
+	const float2 ScreenPositionXY = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+
+	FScreenSpaceData ScreenSpaceData = GetScreenSpaceData(ScreenUV);
+
+	BRANCH
+	if (ScreenSpaceData.GBuffer.ShadingModelID > 0)
+	{
+		const float SceneDepth = CalcSceneDepth(ScreenUV);
+
+		const float2 ClipPosition = GetScreenPositionForProjectionType(ScreenPositionXY, SceneDepth);
+		const float3 TranslatedWorldPosition = mul(float4(ClipPosition, SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+		const float3 CameraVector = GetCameraVectorFromTranslatedWorldPosition(TranslatedWorldPosition);
+
+		FDeferredLightData LightData = InitSWRTLightData();
+
+		const float Dither = InterleavedGradientNoise(SVPos.xy, View.StateFrameIndexMod8);
+
+		// xy are the engine's directional light channels and unused for a spot
+		// light, z is the surface shadow and w the subsurface transmission.
+		float4 LightAttenuation = 1;
+
+	#if SWRT_SHADOWED
+		float3 ToLight;
+		float3 L;
+		BRANCH
+		if (GetLocalLightAttenuation(TranslatedWorldPosition, LightData, ToLight, L) > 0.0f)
+		{
+			// One ray, already traced. No filtering, no comparison and no bias
+			// to tune: the occlusion question was answered in world space by
+			// the pass that wrote this.
+			const float Shadow = SWRTShadowMask.Load(int3((int2)SVPos.xy, 0)).r;
+
+			BRANCH
+			if (SWRTDebugMode != 0)
+			{
+				float3 Debug;
+				if (SWRTDebugColour(Shadow, Debug))
+				{
+					OutColor = float4(Debug, 0) * View.PreExposure;
+					return;
+				}
+			}
+
+			BRANCH
+			if (Shadow <= 0.0f)
+			{
+				return;
+			}
+
+			LightAttenuation = float4(1, 1, Shadow, Shadow);
+		}
+	#endif
+
+		float SurfaceShadow = 1.0f;
+		OutColor += GetDynamicLighting(
+			TranslatedWorldPosition, CameraVector, ScreenSpaceData.GBuffer,
+			ScreenSpaceData.AmbientOcclusion, LightData, LightAttenuation, Dither,
+			uint2(SVPos.xy), SurfaceShadow);
+	}
+
+	OutColor.rgba *= View.PreExposure;
+}
+
+// The fullscreen triangle writes only SV_Position; the stencil test is what
+// restricts it to the pixels the light volume tagged.
+EARLYDEPTHSTENCIL
+void MainPS(
+	float4 SVPos : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	ShadeSWRTSpotLight(SVPos, OutColor);
+}

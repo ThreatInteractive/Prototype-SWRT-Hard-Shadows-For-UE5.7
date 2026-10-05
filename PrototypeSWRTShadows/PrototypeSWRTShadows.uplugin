@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Prototype SWRT Shadows",
+	"Description": "Spot light with software ray traced shadows. Traces one hard shadow ray per lit pixel against a two level BVH built on the GPU from the light's own surviving shadow casters, with no hardware ray tracing requirement.",
+	"Category": "Rendering",
+	"CreatedBy": "Kevin Jimenez",
+	"CreatedByURL": "https://www.youtube.com/@ThreatInteractive",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.7.0",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "PrototypeSWRTShadows",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [ "Win64" ]
+		}
+	]
+}

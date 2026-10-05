@@ -1,0 +1,109 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Pulls one source's triangles out of its vertex and index buffers and writes
+// them into the shared triangle buffer, in the order the BVH build chose.
+//
+// Stored as a vertex and both edges, three float4, so the traversal reads a
+// triangle as three vector loads instead of nine scalar ones and the ray
+// triangle test gets its edges already subtracted. That layout comes from The
+// Forge, Apache License 2.0; see NOTICE.txt.
+//
+// LocalToWorld is the identity for a source whose triangles live in its own
+// local space, which is every static source: the ray is transformed into the
+// instance's frame instead, so two placements of one mesh share this output.
+
+#include "/Engine/Private/Common.ush"
+
+Buffer<float> SWRTExPositions;
+Buffer<uint>  SWRTExIndices;
+
+RWBuffer<float4> SWRTExOutTriangles;
+
+uint SWRTExFirstIndex;
+uint SWRTExNumPrimitives;
+uint SWRTExOutputTriangleOffset;
+float4x4 SWRTExLocalToWorld;
+
+/**
+ * The order the build chose, as packed entries: 27 bits of source triangle,
+ * 2 bits of split depth and 3 bits of split path. 0xFFFFFFFF in the offset
+ * means no order is available yet and the triangles go out as they come.
+ *
+ * A SPLIT entry is a piece of one triangle, cut by repeatedly halving its
+ * longest edge. That is how a long thin triangle gets tight boxes without the
+ * builder having to store new geometry: both halves are rebuilt here from the
+ * original three vertices.
+ */
+Buffer<uint> SWRTExOrder;
+uint SWRTExOrderOffset;
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint TriangleIndex = DispatchThreadId.x;
+	if (TriangleIndex >= SWRTExNumPrimitives)
+	{
+		return;
+	}
+
+	const uint PackedRef = (SWRTExOrderOffset != 0xFFFFFFFFu)
+		? SWRTExOrder[SWRTExOrderOffset + TriangleIndex]
+		: TriangleIndex;
+
+	const uint SourceTriangle = PackedRef & 0x07FFFFFFu;
+	const uint SplitDepth = (PackedRef >> 27) & 0x3u;
+	const uint SplitIndex = (PackedRef >> 29) & 0x7u;
+
+	const uint IndexBase = SWRTExFirstIndex + SourceTriangle * 3;
+
+	uint3 Corner;
+	Corner.x = SWRTExIndices[IndexBase + 0];
+	Corner.y = SWRTExIndices[IndexBase + 1];
+	Corner.z = SWRTExIndices[IndexBase + 2];
+
+	float3 Vertex[3];
+	UNROLL
+	for (uint i = 0; i < 3; ++i)
+	{
+		const uint VertexIndex = Corner[i];
+		const float3 Local = float3(
+			SWRTExPositions[VertexIndex * 3 + 0],
+			SWRTExPositions[VertexIndex * 3 + 1],
+			SWRTExPositions[VertexIndex * 3 + 2]);
+		Vertex[i] = mul(float4(Local, 1.0f), SWRTExLocalToWorld).xyz;
+	}
+
+	// Walk down to the requested piece. Each step halves the longest edge and
+	// keeps the side the next bit of SplitIndex names, so the builder and this
+	// agree on which piece is which without storing either.
+	[unroll]
+	for (uint Step = 0; Step < SplitDepth; ++Step)
+	{
+		const float LenAB = dot(Vertex[1] - Vertex[0], Vertex[1] - Vertex[0]);
+		const float LenBC = dot(Vertex[2] - Vertex[1], Vertex[2] - Vertex[1]);
+		const float LenCA = dot(Vertex[0] - Vertex[2], Vertex[0] - Vertex[2]);
+
+		const bool bTakeLeft = ((SplitIndex >> (SplitDepth - 1u - Step)) & 1u) == 0u;
+
+		if (LenAB >= LenBC && LenAB >= LenCA)
+		{
+			const float3 Mid = (Vertex[0] + Vertex[1]) * 0.5f;
+			if (bTakeLeft) { Vertex[1] = Mid; } else { Vertex[0] = Mid; }
+		}
+		else if (LenBC >= LenCA)
+		{
+			const float3 Mid = (Vertex[1] + Vertex[2]) * 0.5f;
+			if (bTakeLeft) { Vertex[2] = Mid; } else { Vertex[1] = Mid; }
+		}
+		else
+		{
+			const float3 Mid = (Vertex[2] + Vertex[0]) * 0.5f;
+			if (bTakeLeft) { Vertex[0] = Mid; } else { Vertex[2] = Mid; }
+		}
+	}
+
+	const uint OutBase = (SWRTExOutputTriangleOffset + TriangleIndex) * 3;
+	SWRTExOutTriangles[OutBase + 0] = float4(Vertex[0], 0.0f);
+	SWRTExOutTriangles[OutBase + 1] = float4(Vertex[1] - Vertex[0], 0.0f);
+	SWRTExOutTriangles[OutBase + 2] = float4(Vertex[2] - Vertex[0], 0.0f);
+}
