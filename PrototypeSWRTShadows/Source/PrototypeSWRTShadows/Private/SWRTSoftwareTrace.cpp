@@ -2696,8 +2696,14 @@ namespace SWRTTrace
 			GTriangleCache.Triangles.IsValid()
 			&& (uint64)GTriangleCache.Triangles->GetSize() >= RequiredTriangleBytes;
 		const bool bCacheUsable = bBuffersValid && !bSupersetGrew && bTriangleBufferFits;
-		const bool bTrianglesPreserved = bBuffersValid;
 		const bool bReuseTriangleBuffer = bBuffersValid && bTriangleBufferFits;
+
+		// A source's triangles survive only if the BUFFER survives. A fresh
+		// allocation holds whatever the pool left in it, so every source has to
+		// be written into it again however little it moved. Taking this from
+		// bBuffersValid instead let a new buffer be left part filled, which
+		// showed up as the extraction asserting that nothing produced it.
+		const bool bTrianglesPreserved = bReuseTriangleBuffer;
 		TriangleOffsets.Reset(Gathered.Sources.Num());
 		for (int32 SourceIndex = 0; SourceIndex < Gathered.Sources.Num(); ++SourceIndex)
 		{
@@ -2748,12 +2754,28 @@ namespace SWRTTrace
 			}
 			const uint32 Grace =
 				30u;
-			for (int32 SourceIndex = 0; SourceIndex < Gathered.Sources.Num(); ++SourceIndex)
+			// Only ever skips a REWRITE. On a fresh buffer there is nothing to
+			// keep, so a source nothing has reached lately still has to be
+			// written or its triangles are whatever the pool left behind.
+			for (int32 SourceIndex = 0;
+				bReuseTriangleBuffer && SourceIndex < Gathered.Sources.Num();
+				++SourceIndex)
 			{
 				if (!DirtySources[SourceIndex])
 				{
 					continue;
 				}
+
+				// A SKINNED source is never culled. Its triangles are different
+				// every frame, and whether a ray entered it says nothing about
+				// whether its geometry has gone stale: the placement keeps
+				// moving while the mesh inside it is frozen, which reads as
+				// stop motion with the shadow no longer matching its caster.
+				if (Gathered.Sources[SourceIndex].bSkinned)
+				{
+					continue;
+				}
+
 				const int32 Slot = SourceSlots[SourceIndex];
 				if (!GTriangleCache.WrittenTriangles.IsValidIndex(Slot)
 					|| GTriangleCache.WrittenTriangles[Slot] == 0)
