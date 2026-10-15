@@ -738,15 +738,42 @@ void SWRTSpot::RenderSWRTSpotLights(
 
 	RDG_EVENT_SCOPE(GraphBuilder, "SWRTSpotLights");
 
+	// Every light that will draw, and the casters they need BETWEEN them.
+	//
+	// WHY THE CASTERS ARE UNIONED
+	// The triangle cache is one global thing, and each trace zeroes
+	// WrittenTriangles and then refills only the sources IT gathered. Give two
+	// lights different caster lists and each marks the other's sources
+	// unwritten, so an object that casts for both has its slot and its
+	// triangle offset reshuffled between the two traces of a single frame. One
+	// of them then walks a tree whose leaves point at the other's arrangement,
+	// and its shadow appears and disappears frame to frame. It only shows with
+	// more than one light, and only on the casters they share.
+	//
+	// Tracing every light against the union costs each one placements it
+	// cannot reach. The per tile placement list culls those against the hull of
+	// the tile and the light, so they cost a box test rather than a walk.
+	struct FVisibleLight
+	{
+		const FSWRTSpotLightRenderData* Light = nullptr;
+		float FadeFactor = 1.0f;
+		bool bTrace = false;
+	};
+
+	TArray<FVisibleLight> Visible;
+	Visible.Reserve(Lights.Num());
+
+	TArray<const FPrimitiveSceneProxy*> UnionCasters;
+	TSet<const FPrimitiveSceneProxy*> SeenCasters;
+
 	for (const FSWRTSpotLightRenderData& Light : Lights)
 	{
-		float FadeFactor = 1.0f;
-		if (!IsSWRTSpotLightVisibleInView(View, Light, FadeFactor))
+		FVisibleLight Entry;
+		Entry.Light = &Light;
+		if (!IsSWRTSpotLightVisibleInView(View, Light, Entry.FadeFactor))
 		{
 			continue;
 		}
-
-		FRDGTextureRef ShadowMask = nullptr;
 
 		if (Light.bCastShadows && View.Family->EngineShowFlags.DynamicShadows)
 		{
@@ -755,24 +782,47 @@ void SWRTSpot::RenderSWRTSpotLights(
 
 			if (Casters.Num() > 0)
 			{
-				SWRTTrace::FTraceLight TraceLight;
-				// Translated world, because that is the space the trace shader
-				// reconstructs its surface positions in.
-				TraceLight.TranslatedPosition = Light.Position + View.ViewMatrices.GetPreViewTranslation();
-				TraceLight.WorldPosition = Light.Position;
-				TraceLight.Direction = Light.Direction;
-				TraceLight.Radius = Light.Radius;
-				TraceLight.CosOuterCone = Light.CosOuterCone;
-
-				ShadowMask = SWRTTrace::TickSoftwareTrace(
-					GraphBuilder, View, SceneDepthTexture, Casters, TraceLight);
+				Entry.bTrace = true;
+				for (const FPrimitiveSceneProxy* Proxy : Casters)
+				{
+					bool bAlreadySeen = false;
+					SeenCasters.Add(Proxy, &bAlreadySeen);
+					if (!bAlreadySeen)
+					{
+						UnionCasters.Add(Proxy);
+					}
+				}
 			}
+		}
+
+		Visible.Add(Entry);
+	}
+
+	for (const FVisibleLight& Entry : Visible)
+	{
+		const FSWRTSpotLightRenderData& Light = *Entry.Light;
+		FRDGTextureRef ShadowMask = nullptr;
+
+		if (Entry.bTrace)
+		{
+			SWRTTrace::FTraceLight TraceLight;
+			// Translated world, because that is the space the trace shader
+			// reconstructs its surface positions in.
+			TraceLight.TranslatedPosition =
+				Light.Position + View.ViewMatrices.GetPreViewTranslation();
+			TraceLight.WorldPosition = Light.Position;
+			TraceLight.Direction = Light.Direction;
+			TraceLight.Radius = Light.Radius;
+			TraceLight.CosOuterCone = Light.CosOuterCone;
+
+			ShadowMask = SWRTTrace::TickSoftwareTrace(
+				GraphBuilder, View, SceneDepthTexture, UnionCasters, TraceLight);
 		}
 
 		const FSWRTLightVolume Volume = SetupLightVolume(View, Light);
 
 		AddSWRTSpotLightPass(
 			GraphBuilder, View, SceneColorTexture, SceneDepthTexture,
-			Light, FadeFactor, ShadowMask, Volume);
+			Light, Entry.FadeFactor, ShadowMask, Volume);
 	}
 }
